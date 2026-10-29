@@ -10,6 +10,8 @@ import urllib.request
 from collections.abc import Mapping
 from http.cookiejar import Cookie, CookieJar
 
+import anyio
+
 from ._content import ByteStream, UnattachedStream, encode_request, encode_response
 from ._decoders import (
     SUPPORTED_DECODERS,
@@ -877,32 +879,41 @@ class Response:
         """
         Read and return the response content.
         """
-        if not hasattr(self, "_content"):
-            self._content = b"".join(self.iter_bytes())
-        return self._content
+        try:
+            if not hasattr(self, "_content"):
+                self._content = b"".join(self.iter_bytes())
+            return self._content
+        finally:
+            # Close even when a streaming read is interrupted.
+            if isinstance(self.stream, SyncByteStream):
+                self.close()
 
     def iter_bytes(self, chunk_size: int | None = None) -> typing.Iterator[bytes]:
         """
         A byte-iterator over the decoded response content.
         This allows us to handle gzip, deflate, brotli, and zstd encoded responses.
         """
-        if hasattr(self, "_content"):
-            chunk_size = len(self._content) if chunk_size is None else chunk_size
-            for i in range(0, len(self._content), max(chunk_size, 1)):
-                yield self._content[i : i + chunk_size]
-        else:
-            decoder = self._get_content_decoder()
-            chunker = ByteChunker(chunk_size=chunk_size)
-            with request_context(request=self._request):
-                for raw_bytes in self.iter_raw():
-                    decoded = decoder.decode(raw_bytes)
+        try:
+            if hasattr(self, "_content"):
+                chunk_size = len(self._content) if chunk_size is None else chunk_size
+                for i in range(0, len(self._content), max(chunk_size, 1)):
+                    yield self._content[i : i + chunk_size]
+            else:
+                decoder = self._get_content_decoder()
+                chunker = ByteChunker(chunk_size=chunk_size)
+                with request_context(request=self._request):
+                    for raw_bytes in self.iter_raw():
+                        decoded = decoder.decode(raw_bytes)
+                        for chunk in chunker.decode(decoded):
+                            yield chunk
+                    decoded = decoder.flush()
                     for chunk in chunker.decode(decoded):
+                        yield chunk  # pragma: no cover
+                    for chunk in chunker.flush():
                         yield chunk
-                decoded = decoder.flush()
-                for chunk in chunker.decode(decoded):
-                    yield chunk  # pragma: no cover
-                for chunk in chunker.flush():
-                    yield chunk
+        finally:
+            if isinstance(self.stream, SyncByteStream):
+                self.close()
 
     def iter_text(self, chunk_size: int | None = None) -> typing.Iterator[str]:
         """
@@ -947,16 +958,17 @@ class Response:
         self._num_bytes_downloaded = 0
         chunker = ByteChunker(chunk_size=chunk_size)
 
-        with request_context(request=self._request):
-            for raw_stream_bytes in self.stream:
-                self._num_bytes_downloaded += len(raw_stream_bytes)
-                for chunk in chunker.decode(raw_stream_bytes):
-                    yield chunk
+        try:
+            with request_context(request=self._request):
+                for raw_stream_bytes in self.stream:
+                    self._num_bytes_downloaded += len(raw_stream_bytes)
+                    for chunk in chunker.decode(raw_stream_bytes):
+                        yield chunk
 
-        for chunk in chunker.flush():
-            yield chunk
-
-        self.close()
+            for chunk in chunker.flush():
+                yield chunk
+        finally:
+            self.close()
 
     def close(self) -> None:
         """
@@ -975,9 +987,15 @@ class Response:
         """
         Read and return the response content.
         """
-        if not hasattr(self, "_content"):
-            self._content = b"".join([part async for part in self.aiter_bytes()])
-        return self._content
+        try:
+            if not hasattr(self, "_content"):
+                self._content = b"".join([part async for part in self.aiter_bytes()])
+            return self._content
+        finally:
+            # Close even when a streaming read is cancelled or times out.
+            # Do not catch: CancelledError and TimeoutError must propagate.
+            if isinstance(self.stream, AsyncByteStream):
+                await self.aclose()
 
     async def aiter_bytes(
         self, chunk_size: int | None = None
@@ -986,23 +1004,27 @@ class Response:
         A byte-iterator over the decoded response content.
         This allows us to handle gzip, deflate, brotli, and zstd encoded responses.
         """
-        if hasattr(self, "_content"):
-            chunk_size = len(self._content) if chunk_size is None else chunk_size
-            for i in range(0, len(self._content), max(chunk_size, 1)):
-                yield self._content[i : i + chunk_size]
-        else:
-            decoder = self._get_content_decoder()
-            chunker = ByteChunker(chunk_size=chunk_size)
-            with request_context(request=self._request):
-                async for raw_bytes in self.aiter_raw():
-                    decoded = decoder.decode(raw_bytes)
+        try:
+            if hasattr(self, "_content"):
+                chunk_size = len(self._content) if chunk_size is None else chunk_size
+                for i in range(0, len(self._content), max(chunk_size, 1)):
+                    yield self._content[i : i + chunk_size]
+            else:
+                decoder = self._get_content_decoder()
+                chunker = ByteChunker(chunk_size=chunk_size)
+                with request_context(request=self._request):
+                    async for raw_bytes in self.aiter_raw():
+                        decoded = decoder.decode(raw_bytes)
+                        for chunk in chunker.decode(decoded):
+                            yield chunk
+                    decoded = decoder.flush()
                     for chunk in chunker.decode(decoded):
+                        yield chunk  # pragma: no cover
+                    for chunk in chunker.flush():
                         yield chunk
-                decoded = decoder.flush()
-                for chunk in chunker.decode(decoded):
-                    yield chunk  # pragma: no cover
-                for chunk in chunker.flush():
-                    yield chunk
+        finally:
+            if isinstance(self.stream, AsyncByteStream):
+                await self.aclose()
 
     async def aiter_text(
         self, chunk_size: int | None = None
@@ -1051,16 +1073,17 @@ class Response:
         self._num_bytes_downloaded = 0
         chunker = ByteChunker(chunk_size=chunk_size)
 
-        with request_context(request=self._request):
-            async for raw_stream_bytes in self.stream:
-                self._num_bytes_downloaded += len(raw_stream_bytes)
-                for chunk in chunker.decode(raw_stream_bytes):
-                    yield chunk
+        try:
+            with request_context(request=self._request):
+                async for raw_stream_bytes in self.stream:
+                    self._num_bytes_downloaded += len(raw_stream_bytes)
+                    for chunk in chunker.decode(raw_stream_bytes):
+                        yield chunk
 
-        for chunk in chunker.flush():
-            yield chunk
-
-        await self.aclose()
+            for chunk in chunker.flush():
+                yield chunk
+        finally:
+            await self.aclose()
 
     async def aclose(self) -> None:
         """
@@ -1073,7 +1096,12 @@ class Response:
         if not self.is_closed:
             self.is_closed = True
             with request_context(request=self._request):
-                await self.stream.aclose()
+                # Shield pool release. Closing the stream returns the
+                # connection to the pool; cancellation must not skip it.
+                # anyio's shielded cancel scope is the asyncio.shield
+                # equivalent that also holds when running under trio.
+                with anyio.CancelScope(shield=True):
+                    await self.stream.aclose()
 
 
 class Cookies(typing.MutableMapping[str, str]):
