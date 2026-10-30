@@ -4,6 +4,7 @@ Integration tests for authentication.
 Unit tests for auth classes also exist in tests/test_auth.py
 """
 
+import base64
 import hashlib
 import netrc
 import os
@@ -20,6 +21,11 @@ import httpx
 from ..common import FIXTURES_DIR
 
 
+def _basic_auth_header(username: str, password: str) -> str:
+    token = base64.b64encode(f"{username}:{password}".encode()).decode("ascii")
+    return f"Basic {token}"
+
+
 class App:
     """
     A mock app to test auth credentials.
@@ -33,6 +39,20 @@ class App:
         headers = {"www-authenticate": self.auth_header} if self.auth_header else {}
         data = {"auth": request.headers.get("Authorization")}
         return httpx.Response(self.status_code, headers=headers, json=data)
+
+
+class CredentialsApp:
+    """
+    Return 200 only when the request carries the expected Basic credentials.
+    """
+
+    def __init__(self, username: str, password: str) -> None:
+        self.expected = _basic_auth_header(username, password)
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        authorization = request.headers.get("Authorization")
+        status_code = 200 if authorization == self.expected else 401
+        return httpx.Response(status_code, json={"auth": authorization})
 
 
 class DigestApp:
@@ -770,3 +790,142 @@ def test_sync_auth() -> None:
 
     assert response.status_code == 200
     assert response.json() == {"auth": "sync-auth"}
+
+
+def test_client_stream_inherits_auth() -> None:
+    """
+    Sync Client.stream uses client-level auth when no per-call auth= is provided.
+    """
+    url = "https://example.org/"
+    username, password = "user", "password"
+    app = CredentialsApp(username, password)
+
+    with httpx.Client(
+        transport=httpx.MockTransport(app), auth=(username, password)
+    ) as client:
+        with client.stream("GET", url) as response:
+            response.read()
+
+    assert response.status_code == 200
+    assert response.json() == {"auth": _basic_auth_header(username, password)}
+
+
+@pytest.mark.anyio
+async def test_async_client_stream_inherits_auth() -> None:
+    """
+    Async AsyncClient.stream uses client-level auth when no per-call auth= is provided.
+    """
+    url = "https://example.org/"
+    username, password = "user", "password"
+    app = CredentialsApp(username, password)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(app), auth=(username, password)
+    ) as client:
+        async with client.stream("GET", url) as response:
+            await response.aread()
+
+    assert response.status_code == 200
+    assert response.json() == {"auth": _basic_auth_header(username, password)}
+
+
+def test_client_stream_auth_override() -> None:
+    """
+    Sync Client.stream with per-call auth= overrides client-level auth.
+    """
+    url = "https://example.org/"
+    app = CredentialsApp("override_user", "override_password")
+
+    with httpx.Client(
+        transport=httpx.MockTransport(app),
+        auth=("default_user", "default_password"),
+    ) as client:
+        with client.stream(
+            "GET", url, auth=("override_user", "override_password")
+        ) as response:
+            response.read()
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "auth": _basic_auth_header("override_user", "override_password")
+    }
+
+
+@pytest.mark.anyio
+async def test_async_client_stream_auth_override() -> None:
+    """
+    Async AsyncClient.stream with per-call auth= overrides client-level auth.
+    """
+    url = "https://example.org/"
+    app = CredentialsApp("override_user", "override_password")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(app),
+        auth=("default_user", "default_password"),
+    ) as client:
+        async with client.stream(
+            "GET", url, auth=("override_user", "override_password")
+        ) as response:
+            await response.aread()
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "auth": _basic_auth_header("override_user", "override_password")
+    }
+
+
+def test_client_stream_auth_parity_with_get() -> None:
+    """
+    Sync Client.stream applies the same client-level auth as get, post, and request.
+    """
+    url = "https://example.org/"
+    username, password = "user", "password"
+    app = CredentialsApp(username, password)
+    expected = {"auth": _basic_auth_header(username, password)}
+
+    with httpx.Client(
+        transport=httpx.MockTransport(app), auth=(username, password)
+    ) as client:
+        get_response = client.get(url)
+        post_response = client.post(url)
+        request_response = client.request("GET", url)
+        with client.stream("GET", url) as stream_response:
+            stream_response.read()
+
+    assert get_response.status_code == 200
+    assert post_response.status_code == 200
+    assert request_response.status_code == 200
+    assert stream_response.status_code == 200
+    assert get_response.json() == expected
+    assert post_response.json() == expected
+    assert request_response.json() == expected
+    assert stream_response.json() == expected
+
+
+@pytest.mark.anyio
+async def test_async_client_stream_auth_parity_with_get() -> None:
+    """
+    AsyncClient.stream applies the same client-level auth as get, post, and request.
+    """
+    url = "https://example.org/"
+    username, password = "user", "password"
+    app = CredentialsApp(username, password)
+    expected = {"auth": _basic_auth_header(username, password)}
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(app), auth=(username, password)
+    ) as client:
+        get_response = await client.get(url)
+        post_response = await client.post(url)
+        request_response = await client.request("GET", url)
+        async with client.stream("GET", url) as stream_response:
+            await stream_response.aread()
+
+    assert get_response.status_code == 200
+    assert post_response.status_code == 200
+    assert request_response.status_code == 200
+    assert stream_response.status_code == 200
+    assert get_response.json() == expected
+    assert post_response.json() == expected
+    assert request_response.json() == expected
+    assert stream_response.json() == expected
