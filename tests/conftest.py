@@ -268,16 +268,29 @@ class TestServer(Server):
             await self.startup()
 
 
+_SERVER_START_TIMEOUT_S = 10
+_SERVER_STOP_TIMEOUT_S = 5
+
+
 def serve_in_thread(server: TestServer) -> typing.Iterator[TestServer]:
-    thread = threading.Thread(target=server.run)
+    # Daemon so a stuck uvicorn thread cannot keep pytest alive after setup fails.
+    thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
     try:
+        deadline = time.monotonic() + _SERVER_START_TIMEOUT_S
         while not server.started:
+            if time.monotonic() > deadline:
+                server.should_exit = True
+                thread.join(timeout=_SERVER_STOP_TIMEOUT_S)
+                pytest.fail("uvicorn server did not start within 10 seconds")
             time.sleep(1e-3)
         yield server
     finally:
         server.should_exit = True
-        thread.join()
+        if server.started:
+            thread.join()
+        else:
+            thread.join(timeout=_SERVER_STOP_TIMEOUT_S)
 
 
 @pytest.fixture(scope="session")
