@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import contextlib
+import socket
+import threading
+import time
 import typing
 from datetime import timedelta
 
@@ -460,3 +464,54 @@ def test_client_decode_text_using_explicit_encoding():
         assert response.reason_phrase == "OK"
         assert response.encoding == "ISO-8859-1"
         assert response.text == text
+
+
+def _start_slow_server() -> str:
+    """Local server that sends headers, then pauses before the body."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(1)
+    port = sock.getsockname()[1]
+
+    def serve() -> None:
+        try:
+            conn, _addr = sock.accept()
+            with conn:
+                conn.recv(65536)
+                conn.sendall(
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: application/octet-stream\r\n"
+                    b"Transfer-Encoding: chunked\r\n"
+                    b"Connection: close\r\n"
+                    b"\r\n"
+                )
+                time.sleep(2)
+                with contextlib.suppress(OSError):
+                    conn.sendall(b"6\r\nchunk0\r\n0\r\n\r\n")
+        finally:
+            sock.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    return f"http://127.0.0.1:{port}/stream"
+
+
+def test_sync_timeout_during_stream_closes_response():
+    """
+    AC3: Sync client timeout during a streaming read closes the response and
+    returns the connection to the pool, consistent with async behavior.
+    """
+    url = _start_slow_server()
+    seen: list[httpx.Response] = []
+
+    def on_response(response: httpx.Response) -> None:
+        seen.append(response)
+
+    timeout = httpx.Timeout(5.0, read=0.2)
+    with httpx.Client(
+        timeout=timeout, trust_env=False, event_hooks={"response": [on_response]}
+    ) as client:
+        with pytest.raises((httpx.ReadTimeout, httpx.TimeoutException)):
+            client.get(url)
+        assert seen[-1].is_closed
+        pool = client._transport._pool  # type: ignore[attr-defined]
+        assert list(pool._requests) == []

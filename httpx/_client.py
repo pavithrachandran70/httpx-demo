@@ -911,21 +911,29 @@ class Client(BaseClient):
 
         auth = self._build_request_auth(request, auth)
 
-        response = self._send_handling_auth(
-            request,
-            auth=auth,
-            follow_redirects=follow_redirects,
-            history=[],
-        )
+        # `response` stays None when sending fails before a response exists.
+        response: Response | None = None
         try:
-            if not stream:
-                response.read()
+            response = self._send_handling_auth(
+                request,
+                auth=auth,
+                follow_redirects=follow_redirects,
+                history=[],
+            )
+            if stream:
+                # Leave streaming responses open for the caller. `stream()`
+                # closes them on the way out.
+                return response
 
+            response.read()
             return response
 
-        except BaseException as exc:
-            response.close()
-            raise exc
+        finally:
+            # response_cleanup_on_cancel: return the connection to the pool
+            # before a timeout or any other exception propagates. Streaming
+            # responses are excluded so the caller can still read the body.
+            if not stream and response is not None and not response.is_closed:
+                response.close()
 
     def _send_handling_auth(
         self,
@@ -1626,21 +1634,31 @@ class AsyncClient(BaseClient):
 
         auth = self._build_request_auth(request, auth)
 
-        response = await self._send_handling_auth(
-            request,
-            auth=auth,
-            follow_redirects=follow_redirects,
-            history=[],
-        )
+        # `response` stays None when sending fails before a response exists.
+        response: Response | None = None
         try:
-            if not stream:
-                await response.aread()
+            response = await self._send_handling_auth(
+                request,
+                auth=auth,
+                follow_redirects=follow_redirects,
+                history=[],
+            )
+            if stream:
+                # Leave streaming responses open for the caller. `stream()`
+                # closes them on the way out.
+                return response
 
+            await response.aread()
             return response
 
-        except BaseException as exc:
-            await response.aclose()
-            raise exc
+        finally:
+            # response_cleanup_on_cancel: return the connection to the pool
+            # before cancellation, timeout, or any other exception propagates.
+            # Streaming responses are excluded so the caller can still read
+            # the body. `aclose()` is idempotent; the closed check keeps that
+            # explicit.
+            if not stream and response is not None and not response.is_closed:
+                await response.aclose()
 
     async def _send_handling_auth(
         self,

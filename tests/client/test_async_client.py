@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import socket
+import threading
+import time
 import typing
 from datetime import timedelta
 
@@ -373,3 +378,135 @@ async def test_server_extensions(server):
         response = await client.get(url)
     assert response.status_code == 200
     assert response.extensions["http_version"] == b"HTTP/1.1"
+
+
+def _start_slow_server() -> str:
+    """Local server that sends headers, then pauses before the body.
+
+    The pause is long enough for a client timeout or ``asyncio.wait_for`` to
+    fire while the response body is still being read.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(1)
+    port = sock.getsockname()[1]
+
+    def serve() -> None:
+        try:
+            conn, _addr = sock.accept()
+            with conn:
+                conn.recv(65536)
+                conn.sendall(
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: application/octet-stream\r\n"
+                    b"Transfer-Encoding: chunked\r\n"
+                    b"Connection: close\r\n"
+                    b"\r\n"
+                )
+                time.sleep(2)
+                with contextlib.suppress(OSError):
+                    conn.sendall(b"6\r\nchunk0\r\n0\r\n\r\n")
+        finally:
+            sock.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    return f"http://127.0.0.1:{port}/stream"
+
+
+def _inflight_requests(client: httpx.AsyncClient) -> list[typing.Any]:
+    """Requests the connection pool still considers active."""
+    pool = client._transport._pool  # type: ignore[attr-defined]
+    return list(pool._requests)
+
+
+def _deadline_error(backend_name: str) -> type[BaseException]:
+    """Exception raised when a mid-read deadline fires.
+
+    AC1 cancels with ``asyncio.wait_for`` on asyncio. Trio applies the same
+    deadline with ``trio.fail_after``, which raises ``TooSlowError``.
+    """
+    if backend_name == "trio":
+        import trio
+
+        return trio.TooSlowError
+    return asyncio.TimeoutError
+
+
+async def _await_with_deadline(
+    coro: typing.Awaitable[typing.Any],
+    seconds: float,
+    backend_name: str,
+) -> None:
+    """Cancel `coro` after `seconds` (``asyncio.wait_for`` or trio equivalent)."""
+    if backend_name == "trio":
+        import trio
+
+        with trio.fail_after(seconds):
+            await coro
+    else:
+        await asyncio.wait_for(coro, timeout=seconds)
+
+
+@pytest.mark.anyio
+async def test_async_cancel_during_stream_closes_response(anyio_backend_name):
+    """
+    AC1: Cancelling via asyncio.wait_for timeout during a streaming read
+    closes the response and returns the connection to the pool.
+    """
+    url = _start_slow_server()
+    seen: list[httpx.Response] = []
+
+    async def on_response(response: httpx.Response) -> None:
+        seen.append(response)
+
+    async with httpx.AsyncClient(
+        timeout=None, trust_env=False, event_hooks={"response": [on_response]}
+    ) as client:
+        with pytest.raises(_deadline_error(anyio_backend_name)):
+            await _await_with_deadline(client.get(url), 0.4, anyio_backend_name)
+        assert seen[-1].is_closed
+        assert _inflight_requests(client) == []
+
+
+@pytest.mark.anyio
+async def test_async_timeout_during_stream_closes_response():
+    """
+    AC2: A client read timeout during a streaming read closes the response
+    and returns the connection to the pool.
+    """
+    url = _start_slow_server()
+    seen: list[httpx.Response] = []
+
+    async def on_response(response: httpx.Response) -> None:
+        seen.append(response)
+
+    timeout = httpx.Timeout(5.0, read=0.2)
+    async with httpx.AsyncClient(
+        timeout=timeout, trust_env=False, event_hooks={"response": [on_response]}
+    ) as client:
+        with pytest.raises((httpx.ReadTimeout, httpx.TimeoutException)):
+            await client.get(url)
+        assert seen[-1].is_closed
+        assert _inflight_requests(client) == []
+
+
+@pytest.mark.anyio
+async def test_async_cancel_during_body_iteration_closes_response(anyio_backend_name):
+    """
+    AC1 edge case: Cancellation during explicit body iteration closes the
+    response and returns the connection to the pool.
+    """
+    url = _start_slow_server()
+    seen: list[httpx.Response] = []
+
+    async def consume_with_timeout() -> None:
+        async with client.stream("GET", url) as response:
+            seen.append(response)
+            async for _chunk in response.aiter_bytes():
+                pass
+
+    async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+        with pytest.raises(_deadline_error(anyio_backend_name)):
+            await _await_with_deadline(consume_with_timeout(), 0.4, anyio_backend_name)
+        assert seen[-1].is_closed
+        assert _inflight_requests(client) == []
