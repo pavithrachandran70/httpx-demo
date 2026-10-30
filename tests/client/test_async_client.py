@@ -452,6 +452,7 @@ async def test_async_cancel_during_stream_closes_response(anyio_backend_name):
     """
     AC1: Cancelling via asyncio.wait_for timeout during a streaming read
     closes the response and returns the connection to the pool.
+    AC4: No in-flight RuntimeError on client exit.
     """
     url = _start_slow_server()
     seen: list[httpx.Response] = []
@@ -459,13 +460,20 @@ async def test_async_cancel_during_stream_closes_response(anyio_backend_name):
     async def on_response(response: httpx.Response) -> None:
         seen.append(response)
 
-    async with httpx.AsyncClient(
-        timeout=None, trust_env=False, event_hooks={"response": [on_response]}
-    ) as client:
-        with pytest.raises(_deadline_error(anyio_backend_name)):
-            await _await_with_deadline(client.get(url), 0.4, anyio_backend_name)
-        assert seen[-1].is_closed
-        assert _inflight_requests(client) == []
+    # AC4 guard: client __aexit__ must complete without an in-flight RuntimeError.
+    try:
+        async with httpx.AsyncClient(
+            timeout=None, trust_env=False, event_hooks={"response": [on_response]}
+        ) as client:
+            with pytest.raises(_deadline_error(anyio_backend_name)):
+                await _await_with_deadline(client.get(url), 0.4, anyio_backend_name)
+            assert seen[-1].is_closed
+            assert _inflight_requests(client) == []
+        # Explicit AC4 verification: __aexit__ completed without RuntimeError
+    except RuntimeError as exc:
+        if "connection pool was closed while" in str(exc):
+            pytest.fail(f"AC4 violation: {exc}")
+        raise
 
 
 @pytest.mark.anyio
@@ -473,6 +481,7 @@ async def test_async_timeout_during_stream_closes_response():
     """
     AC2: A client read timeout during a streaming read closes the response
     and returns the connection to the pool.
+    AC4: No in-flight RuntimeError on client exit.
     """
     url = _start_slow_server()
     seen: list[httpx.Response] = []
@@ -481,13 +490,20 @@ async def test_async_timeout_during_stream_closes_response():
         seen.append(response)
 
     timeout = httpx.Timeout(5.0, read=0.2)
-    async with httpx.AsyncClient(
-        timeout=timeout, trust_env=False, event_hooks={"response": [on_response]}
-    ) as client:
-        with pytest.raises((httpx.ReadTimeout, httpx.TimeoutException)):
-            await client.get(url)
-        assert seen[-1].is_closed
-        assert _inflight_requests(client) == []
+    # AC4 guard: client __aexit__ must complete without an in-flight RuntimeError.
+    try:
+        async with httpx.AsyncClient(
+            timeout=timeout, trust_env=False, event_hooks={"response": [on_response]}
+        ) as client:
+            with pytest.raises((httpx.ReadTimeout, httpx.TimeoutException)):
+                await client.get(url)
+            assert seen[-1].is_closed
+            assert _inflight_requests(client) == []
+        # Explicit AC4 verification: __aexit__ completed without RuntimeError
+    except RuntimeError as exc:
+        if "connection pool was closed while" in str(exc):
+            pytest.fail(f"AC4 violation: {exc}")
+        raise
 
 
 @pytest.mark.anyio
@@ -495,6 +511,7 @@ async def test_async_cancel_during_body_iteration_closes_response(anyio_backend_
     """
     AC1 edge case: Cancellation during explicit body iteration closes the
     response and returns the connection to the pool.
+    AC4: No in-flight RuntimeError on client exit.
     """
     url = _start_slow_server()
     seen: list[httpx.Response] = []
@@ -505,8 +522,17 @@ async def test_async_cancel_during_body_iteration_closes_response(anyio_backend_
             async for _chunk in response.aiter_bytes():
                 pass
 
-    async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
-        with pytest.raises(_deadline_error(anyio_backend_name)):
-            await _await_with_deadline(consume_with_timeout(), 0.4, anyio_backend_name)
-        assert seen[-1].is_closed
-        assert _inflight_requests(client) == []
+    # AC4 guard: client __aexit__ must complete without an in-flight RuntimeError.
+    try:
+        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+            with pytest.raises(_deadline_error(anyio_backend_name)):
+                await _await_with_deadline(
+                    consume_with_timeout(), 0.4, anyio_backend_name
+                )
+            assert seen[-1].is_closed
+            assert _inflight_requests(client) == []
+        # Explicit AC4 verification: __aexit__ completed without RuntimeError
+    except RuntimeError as exc:
+        if "connection pool was closed while" in str(exc):
+            pytest.fail(f"AC4 violation: {exc}")
+        raise

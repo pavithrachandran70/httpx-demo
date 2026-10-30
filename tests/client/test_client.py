@@ -499,6 +499,7 @@ def test_sync_timeout_during_stream_closes_response():
     """
     AC3: Sync client timeout during a streaming read closes the response and
     returns the connection to the pool, consistent with async behavior.
+    No in-flight RuntimeError on client exit.
     """
     url = _start_slow_server()
     seen: list[httpx.Response] = []
@@ -507,11 +508,18 @@ def test_sync_timeout_during_stream_closes_response():
         seen.append(response)
 
     timeout = httpx.Timeout(5.0, read=0.2)
-    with httpx.Client(
-        timeout=timeout, trust_env=False, event_hooks={"response": [on_response]}
-    ) as client:
-        with pytest.raises((httpx.ReadTimeout, httpx.TimeoutException)):
-            client.get(url)
-        assert seen[-1].is_closed
-        pool = client._transport._pool  # type: ignore[attr-defined]
-        assert list(pool._requests) == []
+    # AC3 guard: client __exit__ must complete without an in-flight RuntimeError.
+    try:
+        with httpx.Client(
+            timeout=timeout, trust_env=False, event_hooks={"response": [on_response]}
+        ) as client:
+            with pytest.raises((httpx.ReadTimeout, httpx.TimeoutException)):
+                client.get(url)
+            assert seen[-1].is_closed
+            pool = client._transport._pool  # type: ignore[attr-defined]
+            assert list(pool._requests) == []
+        # Explicit AC3 verification: __exit__ completed without RuntimeError
+    except RuntimeError as exc:
+        if "connection pool was closed while" in str(exc):
+            pytest.fail(f"AC3 violation: {exc}")
+        raise
